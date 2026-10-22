@@ -30,7 +30,7 @@ For compatibility, a host without Hermes' safe context-local profile helper cont
 
 ### GET `/status`
 
-Returns plugin status, active Hermes home, configured memory provider, built-in memory paths, holographic DB path, Mem0 configuration status, Honcho configuration status, Mnemosyne configuration status, Hindsight configuration status, and ByteRover CLI/configuration status.
+Returns plugin status, active Hermes home, configured memory provider, built-in memory paths, holographic DB path, Mem0 configuration status, Honcho configuration status, Mnemosyne configuration status, Hindsight configuration status, ByteRover CLI/configuration status, and CortexIQ configuration status.
 
 Example:
 
@@ -232,9 +232,47 @@ Example:
 curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/hindsight/reflect?query=dashboard' | jq
 ```
 
+### GET `/cortexiq`
+
+Returns read-only CortexIQ configuration plus store statistics and the stored namespace list, obtained through the serving process's `CORTEXIQ_API_TOKEN`:
+
+- `GET /api/v1/stats` (entry count, database size, oldest/newest rows, table counts)
+- `GET /api/v1/namespaces`
+
+Remote reads only happen while `memory.provider` is `cortexiq` and a token is present; the explicit `/cortexiq*` endpoints below still work whenever the active profile has a token. The token itself is never returned. CortexIQ does not expose mutation routes here: `/api/v1/remember`, namespace creation, and all MCP write tools stay with the provider/MCP layer.
+
+```bash
+curl http://127.0.0.1:9119/api/plugins/hermes-memory-ui/cortexiq | jq
+```
+
+### GET `/cortexiq/contents`
+
+Returns a read-only page of consolidated CortexIQ facts through `GET /api/v1/facts`.
+
+Query parameters:
+
+- `limit`: 1-100, default 25
+
+```bash
+curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/cortexiq/contents?limit=25' | jq
+```
+
+### GET `/cortexiq/recall`
+
+Runs explicit hybrid (RRF) recall through `POST /api/v1/recall`, mirroring the CortexIQ Hermes provider, including its configured recall scope/namespaces and identity semantics. It is always user-triggered.
+
+Query parameters:
+
+- `query`: required query string
+- `limit`: 1-100, default 25
+
+```bash
+curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/cortexiq/recall?query=dashboard&limit=25' | jq
+```
+
 ### GET `/snapshot`
 
-Combined payload used by the UI. Accepts the same query parameters as `/holographic`; `limit` and `search` are also applied to Mem0, Honcho, Mnemosyne, and ByteRover, with Honcho and Mnemosyne internally capped at 100 and ByteRover capped at 50. Hindsight in `/snapshot` is status/config only and does not query recall/reflect.
+Combined payload used by the UI. Accepts the same query parameters as `/holographic`; `limit` and `search` are also applied to Mem0, Honcho, Mnemosyne, and ByteRover, with Honcho and Mnemosyne internally capped at 100 and ByteRover capped at 50. Hindsight in `/snapshot` is status/config only and does not query recall/reflect. CortexIQ in `/snapshot` is configuration, store stats, and namespaces only while it is the active provider; its recall and contents views are separate explicit endpoints.
 
 ```bash
 curl http://127.0.0.1:9119/api/plugins/hermes-memory-ui/snapshot | jq

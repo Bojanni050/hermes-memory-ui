@@ -24,11 +24,11 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
 
-const VERSION = '0.6.4'
+const VERSION = '0.6.5'
 const PLUGIN_ID = 'hermes-memory-ui'
 const PLUGIN_NAME = 'Hermes Memory UI'
 const PLUGIN_ROUTE = '/memory'
-const PROVIDER_KEYS = ['holographic', 'mem0', 'honcho', 'mnemosyne', 'hindsight', 'byterover']
+const PROVIDER_KEYS = ['holographic', 'mem0', 'honcho', 'mnemosyne', 'hindsight', 'byterover', 'cortexiq']
 const MUTED = { color: 'var(--ui-text-secondary)' }
 const BORDER = { borderColor: 'var(--ui-stroke-secondary)' }
 export const QUERY_CONTROL_CONFIG = {
@@ -48,6 +48,10 @@ export const QUERY_CONTROL_CONFIG = {
   },
   byterover: {
     queryTimeout: 60
+  },
+  cortexiq: {
+    defaultLimit: 25,
+    limitOptions: [5, 10, 25, 50, 100]
   },
   session: {
     defaultLimit: 3,
@@ -427,6 +431,15 @@ export function buildProviderOperationOptions(provider, kind, controls = {}) {
     if (kind === 'recall') return { query, limit, temporalWeight }
     if (kind === 'prefetch') return { query }
   }
+  if (provider === 'cortexiq') {
+    const limit = selectedOption(
+      controls.limit,
+      QUERY_CONTROL_CONFIG.cortexiq.limitOptions,
+      QUERY_CONTROL_CONFIG.cortexiq.defaultLimit
+    )
+    if (kind === 'contents') return { limit } // /facts has no server-side search; recall is the search path
+    if (kind === 'recall') return { query, limit }
+  }
   throw new Error(`Unsupported ${provider} operation: ${kind}`)
 }
 
@@ -461,7 +474,12 @@ export function createMemoryApi(ctx) {
       limit,
       temporal_weight: temporalWeight
     }, 120_000),
-    prefetchMnemosyne: query => get('/mnemosyne/prefetch', { query }, 120_000)
+    prefetchMnemosyne: query => get('/mnemosyne/prefetch', { query }, 120_000),
+    getCortexiqContents: options => get('/cortexiq/contents', options, 120_000),
+    recallCortexiq: (
+      query,
+      limit = QUERY_CONTROL_CONFIG.cortexiq.defaultLimit
+    ) => get('/cortexiq/recall', { query, limit }, 120_000)
   }
 }
 
@@ -1330,6 +1348,10 @@ function OperationResult({ mutation, provider, kind, t }) {
     content = context
       ? jsx('p', { className: 'whitespace-pre-wrap break-words text-sm leading-relaxed', children: String(context) })
       : jsx(EmptyState, { title: t('operationEmpty') })
+  } else if (provider === 'cortexiq' && kind === 'contents') {
+    content = jsx(Collection, { items: data?.facts, title: t('facts'), t, kind: t('result') })
+  } else if (provider === 'cortexiq' && kind === 'recall') {
+    content = jsx(Collection, { items: data?.results, title: t('results'), t, kind: t('result') })
   } else if (provider === 'byterover') {
     const answer = data?.answer_summary || data?.answer
     content = jsxs('div', {
@@ -1591,6 +1613,134 @@ function ByteRoverProvider({ data, api, t }) {
   })
 }
 
+function humanBytes(value) {
+  const bytes = Number(value)
+  if (!Number.isFinite(bytes) || bytes < 0) return display(bytes, (key) => key)
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let size = bytes
+  let index = 0
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024
+    index += 1
+  }
+  return `${index === 0 ? size : size.toFixed(1)} ${units[index]}`
+}
+
+function CortexIQOperationControls({ api, t }) {
+  const config = QUERY_CONTROL_CONFIG.cortexiq
+  const [query, setQuery] = useState('')
+  const [limit, setLimit] = useState(config.defaultLimit)
+  const contents = useMutation({
+    mutationFn: options => api.getCortexiqContents(options)
+  })
+  const recall = useMutation({
+    mutationFn: controls => {
+      const options = buildProviderOperationOptions('cortexiq', 'recall', controls)
+      return api.recallCortexiq(options.query, options.limit)
+    }
+  })
+  useEffect(() => {
+    contents.mutate(buildProviderOperationOptions('cortexiq', 'contents', { limit: config.defaultLimit }))
+  }, [])
+  const controls = { query, limit }
+  return jsxs('div', {
+    className: 'space-y-3 rounded-md border p-3',
+    style: BORDER,
+    children: [
+      jsx('p', { className: 'text-xs', style: MUTED, children: t('queryHint') }),
+      jsxs('div', {
+        className: 'flex flex-wrap items-end gap-2',
+        children: [
+          jsx(Field, {
+            label: t('queryContentFilter'),
+            children: jsx(Input, {
+              value: query,
+              onChange: event => setQuery(event.target.value),
+              placeholder: t('queryContentPlaceholder')
+            })
+          }),
+          jsx(Field, {
+            label: t('limit'),
+            children: jsx(NativeSelect, {
+              value: limit,
+              onValueChange: value => setLimit(Number(value)),
+              placeholder: String(config.defaultLimit),
+              options: config.limitOptions.map(value => ({ value, label: String(value) }))
+            })
+          })
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex flex-wrap gap-2',
+        children: [
+          jsx(Button, {
+            onClick: () => recall.mutate(controls),
+            disabled: !query.trim() || recall.isPending,
+            children: t('recall')
+          }),
+          jsx(Button, {
+            onClick: () => contents.mutate(buildProviderOperationOptions('cortexiq', 'contents', controls)),
+            disabled: contents.isPending,
+            children: t('loadContents')
+          })
+        ]
+      }),
+      jsx(OperationResult, { mutation: contents, provider: 'cortexiq', kind: 'contents', t }),
+      jsx(OperationResult, { mutation: recall, provider: 'cortexiq', kind: 'recall', t })
+    ]
+  })
+}
+
+function CortexIQProvider({ data, api, t }) {
+  const recallNamespaces = Array.isArray(data?.recall_namespaces) ? data.recall_namespaces : null
+  return jsx(ProviderShell, {
+    data,
+    name: 'CortexIQ',
+    t,
+    path: data?.api_url,
+    stats: [
+      { label: t('entries'), value: finite(data?.entry_count), hint: 'episodes + facts' },
+      { label: 'Database', value: humanBytes(data?.database_bytes), hint: data?.newest ? `newest ${formatTime(data.newest, t)}` : 'server store' },
+      {
+        label: 'Namespaces',
+        value: finite(data?.namespace_count, list(data?.namespaces).length),
+        hint: recallNamespaces?.length ? recallNamespaces.join(', ') : 'recall searches everything'
+      },
+      {
+        label: 'Recall scope',
+        value: display(data?.recall_scope || 'global', t),
+        hint: data?.min_score !== undefined && data?.min_score !== null ? `min score ${Number(data.min_score).toFixed(2)}` : 'hybrid RRF'
+      }
+    ],
+    statusRows: [
+      { label: 'API URL', value: data?.api_url },
+      { label: 'Token', value: data?.token_present },
+      { label: 'Base namespace', value: data?.base_namespace },
+      { label: 'Ingest namespace', value: data?.ingest_namespace },
+      { label: 'Capture assistant', value: data?.capture_assistant },
+      { label: 'Ingest path', value: data?.ingest_path }
+    ],
+    children: jsxs('div', {
+      className: 'space-y-4',
+      children: [
+        list(data?.namespaces).length ? jsxs('details', {
+          children: [
+            jsx('summary', { className: 'cursor-pointer text-xs font-medium', style: MUTED, children: `Namespaces (${data.namespaces.length})` }),
+            jsx('div', { className: 'mt-2', children: jsx(StructuredValue, { value: data.namespaces, t }) })
+          ]
+        }) : null,
+        list(data?.stats?.tables).length ? jsxs('details', {
+          children: [
+            jsx('summary', { className: 'cursor-pointer text-xs font-medium', style: MUTED, children: `Tables (${data.stats.tables.length})` }),
+            jsx('div', { className: 'mt-2', children: jsx(StructuredValue, { value: data.stats.tables, t }) })
+          ]
+        }) : null
+      ]
+    }),
+    actions: jsx(CortexIQOperationControls, { api, t })
+  })
+}
+
 function GenericProvider({ provider, data, t }) {
   const ignored = new Set(['id', 'label', 'provider_configured', 'mode', 'error', 'generated_at'])
   const rows = Object.entries(data || {})
@@ -1620,6 +1770,7 @@ function GenericProvider({ provider, data, t }) {
 
 function providerName(provider) {
   if (provider === 'byterover') return 'ByteRover'
+  if (provider === 'cortexiq') return 'CortexIQ'
   return `${provider?.charAt(0).toUpperCase()}${provider?.slice(1)}`
 }
 
@@ -1631,6 +1782,7 @@ function ProviderView({ provider, snapshot, api, t }) {
   if (provider === 'mnemosyne') return jsx(MnemosyneProvider, { data, api, t })
   if (provider === 'hindsight') return jsx(HindsightProvider, { data, api, t })
   if (provider === 'byterover') return jsx(ByteRoverProvider, { data, api, t })
+  if (provider === 'cortexiq') return jsx(CortexIQProvider, { data, api, t })
   return jsx(GenericProvider, { provider, data, t })
 }
 

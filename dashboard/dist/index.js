@@ -871,6 +871,165 @@
     );
   }
 
+  function fmtBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 0) return "—";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let index = 0;
+    let size = bytes;
+    while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; }
+    return (index === 0 ? String(size) : size.toFixed(1)) + " " + units[index];
+  }
+
+  function CortexIQRow(props) {
+    const item = props.item || {};
+    return e("div", { className: "memory-ui-fact" },
+      e("div", { className: "memory-ui-fact-top" },
+        e("div", { className: "memory-ui-fact-id" }, "#" + item.id),
+        item.score !== null && item.score !== undefined ? e(Badge, { tone: "outline" }, "score " + Number(item.score).toFixed(3)) : null,
+        item.match ? e(Badge, { tone: "outline" }, item.match) : null,
+        item.type ? e(Badge, { tone: "outline" }, item.type) : null,
+        item.confidence !== null && item.confidence !== undefined ? e(Badge, { tone: "outline" }, "confidence " + Number(item.confidence).toFixed(2)) : null
+      ),
+      item.title ? e("div", { className: "memory-ui-muted" }, item.title) : null,
+      e("div", { className: "memory-ui-fact-content" }, item.content || ""),
+      item.entity || item.property || item.value ? e("div", { className: "memory-ui-tags" }, item.entity + " · " + item.property + (item.value ? " = " + item.value : "")) : null,
+      item.updated_at || item.created_at ? e("div", { className: "memory-ui-muted" },
+        item.updated_at ? "Updated: " + fmtTime(item.updated_at) : "Created: " + fmtTime(item.created_at)
+      ) : null
+    );
+  }
+
+  function CortexIQSection(props) {
+    const data = props.cortexiq;
+    const [query, setQuery] = useState("");
+    const [limit, setLimit] = useState("25");
+    const [recallData, setRecallData] = useState(null);
+    const [contentsData, setContentsData] = useState(null);
+    const [recallLoading, setRecallLoading] = useState(false);
+    const [contentsLoading, setContentsLoading] = useState(false);
+    const [recallError, setRecallError] = useState(null);
+    const [contentsError, setContentsError] = useState(null);
+    if (!data) return null;
+
+    function runRecall() {
+      if (!query.trim()) {
+        setRecallError("Enter a query first.");
+        return;
+      }
+      const p = new URLSearchParams();
+      p.set("query", query);
+      p.set("limit", limit || "25");
+      setRecallLoading(true);
+      setRecallError(null);
+      fetchPluginJSON("/api/plugins/hermes-memory-ui/cortexiq/recall?" + p.toString())
+        .then(publishFresh(setRecallData))
+        .catch(function (err) { setRecallError(err && err.message ? err.message : String(err)); })
+        .finally(function () { setRecallLoading(false); });
+    }
+
+    function refreshContents() {
+      const p = new URLSearchParams();
+      p.set("limit", limit || "25");
+      setContentsLoading(true);
+      setContentsError(null);
+      fetchPluginJSON("/api/plugins/hermes-memory-ui/cortexiq/contents?" + p.toString())
+        .then(publishFresh(setContentsData))
+        .catch(function (err) { setContentsError(err && err.message ? err.message : String(err)); })
+        .finally(function () { setContentsLoading(false); });
+    }
+
+    useEffect(function () { refreshContents(); }, []);
+
+    const recallResults = recallData && recallData.results ? recallData.results : [];
+    const factRows = contentsData ? contentsData.facts || [] : (data.facts || []);
+    const namespaces = data.namespaces || [];
+    return e("div", { className: "memory-ui-section" },
+      e("div", { className: "memory-ui-section-header" },
+        e("div", null,
+          e("h2", null, "CortexIQ memory"),
+          e("p", null, "Read-only view of the CortexIQ store, plus explicit hybrid recall. No remember, ingest, or namespace writes.")
+        ),
+        e("div", { className: "memory-ui-badges" },
+          e(Badge, { tone: data.provider_configured ? "outline" : "secondary" }, data.provider_configured ? "active provider" : "not active"),
+          e(Badge, { tone: data.token_present ? "outline" : "secondary" }, data.token_present ? "token present" : "no token"),
+          e(Badge, { tone: "outline" }, "recall scope: " + (data.recall_scope || "global"))
+        )
+      ),
+      e("div", { className: "memory-ui-grid-4" },
+        e(StatCard, { label: "Entries", value: data.entry_count || 0, hint: "episodes + facts stored by CortexIQ" }),
+        e(StatCard, { label: "Database", value: fmtBytes(data.database_bytes), hint: data.newest ? "newest: " + fmtTime(data.newest) : "server store size" }),
+        e(StatCard, { label: "Namespaces", value: data.namespace_count || 0, hint: Array.isArray(data.recall_namespaces) && data.recall_namespaces.length ? "searching: " + data.recall_namespaces.join(", ") : "recall searches everything" }),
+        e(StatCard, { label: "Min score", value: data.min_score !== undefined && data.min_score !== null ? Number(data.min_score).toFixed(2) : "0.60", hint: "RRF recall threshold" })
+      ),
+      e(Card, null,
+        e(CardContent, { className: "memory-ui-controls memory-ui-provider-controls" },
+          e("div", { className: "memory-ui-control" },
+            e("label", null, "Query"),
+            e(Input, {
+              value: query,
+              placeholder: "hybrid recall over CortexIQ namespaces...",
+              onChange: function (ev) { setQuery(ev.target.value); },
+              onKeyDown: function (ev) { if (ev.key === "Enter") runRecall(); }
+            })
+          ),
+          e("div", { className: "memory-ui-control" },
+            e("label", null, "Limit"),
+            e("select", {
+              className: "memory-ui-select",
+              value: limit,
+              onChange: function (ev) { setLimit(ev.target.value); }
+            },
+              e("option", { value: "10" }, "10"),
+              e("option", { value: "25" }, "25"),
+              e("option", { value: "50" }, "50"),
+              e("option", { value: "100" }, "100")
+            )
+          ),
+          e("div", { className: "memory-ui-provider-actions" },
+            e(Button, { onClick: runRecall, className: "memory-ui-refresh", disabled: recallLoading }, recallLoading ? "Running..." : "Recall"),
+            e(Button, { onClick: refreshContents, className: "memory-ui-refresh", disabled: contentsLoading }, contentsLoading ? "Refreshing..." : "Refresh contents")
+          )
+        )
+      ),
+      e(ErrorBox, { error: data.error || recallError || contentsError || (recallData && recallData.error) || (contentsData && contentsData.error) }),
+      e("div", { className: "memory-ui-path" }, data.api_url),
+      recallData && !recallData.error ? e("div", { className: "memory-ui-fact-list" },
+        e("div", { className: "memory-ui-muted" },
+          "Recall: ", recallData.query || query,
+          Array.isArray(recallData.namespaces_used) && recallData.namespaces_used.length ? " · namespaces: " + recallData.namespaces_used.join(", ") : " · all namespaces"
+        ),
+        recallResults.length
+          ? recallResults.map(function (item, index) { return e(CortexIQRow, { key: "cortexiq-recall-" + (item.id ?? index), item: item }); })
+          : e(EmptyState, null, "No CortexIQ memories matched this query.")
+      ) : null,
+      e("div", { className: "memory-ui-fact-list" },
+        e("div", { className: "memory-ui-contents-toolbar" },
+          e("div", { className: "memory-ui-muted" }, "Contents · facts: ", contentsData ? (contentsData.fact_count || 0) : "—", " / ", contentsData ? (contentsData.total_facts || 0) : "—"),
+          e(Button, { onClick: refreshContents, className: "memory-ui-refresh", disabled: contentsLoading }, contentsLoading ? "Refreshing..." : "Refresh contents")
+        ),
+        contentsLoading && !contentsData ? e(EmptyState, null, "Loading CortexIQ contents...") : null,
+        !contentsLoading && contentsData && factRows.length
+          ? factRows.map(function (item, index) { return e(CortexIQRow, { key: "cortexiq-fact-" + (item.id ?? index), item: item }); })
+          : null,
+        !contentsLoading && contentsData && !factRows.length ? e(EmptyState, null, "No CortexIQ facts returned.") : null,
+        !contentsLoading && !contentsData ? e(EmptyState, null, data.token_present ? "Contents not loaded yet." : "CortexIQ API token is missing.") : null
+      ),
+      namespaces.length ? e(Card, null,
+        e(CardContent, null,
+          e("div", { className: "memory-ui-muted" }, "Stored namespaces"),
+          e("div", { className: "memory-ui-entry-list" }, namespaces.map(function (ns, index) {
+            return e("div", { key: "cortexiq-ns-" + (ns.slug || index), className: "memory-ui-entry" },
+              e("div", { className: "memory-ui-entry-index" }, ns.slug || "#"),
+              e("div", { className: "memory-ui-entry-content" }, ns.name || "", ns.created_at ? e("span", { className: "memory-ui-muted" }, " · since " + fmtTime(ns.created_at)) : null)
+            );
+          }))
+        )
+      ) : null,
+      e("div", { className: "memory-ui-path" }, data.config_path)
+    );
+  }
+
   function MnemosyneResultRow(props) {
     const result = props.result;
     const metadata = result.metadata && Object.keys(result.metadata).length ? JSON.stringify(result.metadata) : "";
@@ -1059,13 +1218,15 @@
     const mnemosyne = snapshot && snapshot.mnemosyne;
     const hindsight = snapshot && snapshot.hindsight;
     const byterover = snapshot && snapshot.byterover;
+    const cortexiq = snapshot && snapshot.cortexiq;
     const showHolographic = !!(holographic && holographic.provider_configured);
     const showMem0 = !!(mem0 && mem0.provider_configured);
     const showHoncho = !!(honcho && honcho.provider_configured);
     const showMnemosyne = !!(mnemosyne && mnemosyne.provider_configured);
     const showHindsight = !!(hindsight && hindsight.provider_configured);
     const showByteRover = !!(byterover && byterover.provider_configured);
-    const heroGridClass = showHolographic || showMem0 || showHoncho || showMnemosyne || showHindsight || showByteRover ? "memory-ui-grid-4" : "memory-ui-grid-2";
+    const showCortexIQ = !!(cortexiq && cortexiq.provider_configured);
+    const heroGridClass = showHolographic || showMem0 || showHoncho || showMnemosyne || showHindsight || showByteRover || showCortexIQ ? "memory-ui-grid-4" : "memory-ui-grid-2";
 
     return e("div", { className: "memory-ui-page" },
       e(Card, { className: "memory-ui-hero" },
@@ -1090,6 +1251,7 @@
             showMnemosyne ? e(StatCard, { label: "Mnemosyne", value: mnemosyne ? (mnemosyne.total_memories || 0) : 0, hint: "local episodes" }) : null,
             showByteRover ? e(StatCard, { label: "ByteRover", value: byterover && byterover.project_exists ? "active" : "configured", hint: "search/query memory" }) : null,
             showHindsight ? e(StatCard, { label: "Hindsight", value: hindsight ? (hindsight.bank_id || "active") : "—", hint: "query-only memory" }) : null,
+            showCortexIQ ? e(StatCard, { label: "CortexIQ", value: cortexiq ? (cortexiq.entry_count || 0) : 0, hint: "episodes + facts" }) : null,
             e(StatCard, { label: "Hermes home", value: builtin ? "active" : "—", hint: builtin ? builtin.hermes_home : "loading" }),
             e(StatCard, { label: "Generated", value: snapshot.generated_at ? fmtTime(snapshot.generated_at) : "—", hint: "snapshot time" })
           ) : e(EmptyState, null, "Loading memory snapshot...")
@@ -1122,6 +1284,10 @@
         showHindsight ? e(React.Fragment, null,
           e(Separator, null),
           e(HindsightSection, { hindsight: hindsight })
+        ) : null,
+        showCortexIQ ? e(React.Fragment, null,
+          e(Separator, null),
+          e(CortexIQSection, { cortexiq: cortexiq })
         ) : null
       ) : null
     );

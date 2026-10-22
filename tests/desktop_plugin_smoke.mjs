@@ -164,6 +164,8 @@ await api.reflectHindsight('summarize dashboard')
 await api.getMnemosyneContents({ search: 'dashboard', limit: 100 })
 await api.recallMnemosyne('remember dashboard', 100, 0.8)
 await api.prefetchMnemosyne('inject dashboard')
+await api.getCortexiqContents({ limit: 50 })
+await api.recallCortexiq('remember dashboard', 50)
 
 const visibleProviders = visibleProviderKeys({
   holographic: { provider_configured: true },
@@ -171,7 +173,8 @@ const visibleProviders = visibleProviderKeys({
   honcho: { provider_configured: true },
   mnemosyne: { provider_configured: false },
   hindsight: { provider_configured: true },
-  byterover: { provider_configured: false }
+  byterover: { provider_configured: false },
+  cortexiq: { provider_configured: true }
 })
 const normalizedFilters = normalizeSnapshotFilters({
   category: '  project  ',
@@ -207,6 +210,14 @@ const operationOptions = {
     query: '  release plan  ',
     limit: 100,
     temporalWeight: 0.8
+  }),
+  cortexiqContents: buildProviderOperationOptions('cortexiq', 'contents', {
+    query: '  release plan  ',
+    limit: 100
+  }),
+  cortexiqRecall: buildProviderOperationOptions('cortexiq', 'recall', {
+    query: '  release plan  ',
+    limit: 100
   })
 }
 

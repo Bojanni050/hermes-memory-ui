@@ -3,10 +3,10 @@
 Mounted by Hermes at /api/plugins/hermes-memory-ui/.
 
 Read-only inspection covers built-in memory files, holographic memory, Mem0,
-Honcho, Mnemosyne, Hindsight, and ByteRover provider state. No mutation
-endpoints are exposed intentionally. Memory writes should go through Hermes'
-memory/fact_store tools or provider classes so validation, locking, FTS/HRR
-maintenance, and provider-specific semantics are preserved.
+Honcho, Mnemosyne, Hindsight, ByteRover, and CortexIQ provider state. No
+mutation endpoints are exposed intentionally. Memory writes should go through
+Hermes' memory/fact_store tools or provider classes so validation, locking,
+FTS/HRR maintenance, and provider-specific semantics are preserved.
 """
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from contextvars import copy_context
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -79,7 +81,7 @@ async def _profile_request_scope(profile: Optional[str] = Query(None)):
 
 router = APIRouter(dependencies=[Depends(_profile_request_scope)])
 
-PLUGIN_VERSION = "0.6.4"
+PLUGIN_VERSION = "0.6.5"
 ENTRY_DELIMITER = "\n§\n"
 DEFAULT_MEMORY_LIMIT = 2200
 DEFAULT_USER_LIMIT = 1375
@@ -96,6 +98,33 @@ MAX_MNEMOSYNE_LIMIT = 100
 DEFAULT_BYTEROVER_LIMIT = 10
 MAX_BYTEROVER_LIMIT = 50
 DEFAULT_BYTEROVER_QUERY_TIMEOUT = 60
+DEFAULT_CORTEXIQ_LIMIT = 25
+MAX_CORTEXIQ_LIMIT = 100
+CORTEXIQ_DEFAULT_API_URL = "http://127.0.0.1:18101"
+CORTEXIQ_RECALL_PATH = "/api/v1/recall"
+CORTEXIQ_INGEST_PATH = "/api/v1/remember"
+CORTEXIQ_STATS_PATH = "/api/v1/stats"
+CORTEXIQ_NAMESPACES_PATH = "/api/v1/namespaces"
+CORTEXIQ_FACTS_PATH = "/api/v1/facts"
+CORTEXIQ_FETCH_TIMEOUT = 10.0
+CORTEXIQ_RECALL_TIMEOUT = 30.0
+# Mirrors the env keys the bundled cortexiq_hermes provider reads; JSON values
+# in cortexiq.json win over these, exactly like the provider resolves them.
+CORTEXIQ_ENV_KEYS = {
+    "api_url": "CORTEXIQ_API_URL",
+    "base_namespace": "CORTEXIQ_NAMESPACE_BASE",
+    "namespace": "CORTEXIQ_NAMESPACE",
+    "ingest_namespace": "CORTEXIQ_INGEST_NAMESPACE",
+    "ingest_path": "CORTEXIQ_INGEST_PATH",
+    "recall_scope": "CORTEXIQ_RECALL_SCOPE",
+    "recall_limit": "CORTEXIQ_RECALL_LIMIT",
+    "min_score": "CORTEXIQ_MIN_SCORE",
+    "max_chars": "CORTEXIQ_MAX_CHARS",
+    "turn_importance": "CORTEXIQ_TURN_IMPORTANCE",
+    "capture_assistant": "CORTEXIQ_CAPTURE_ASSISTANT",
+    "assistant_max_chars": "CORTEXIQ_ASSISTANT_MAX_CHARS",
+    "capture_max_chars": "CORTEXIQ_CAPTURE_MAX_CHARS",
+}
 DEFAULT_SESSION_SEARCH_LIMIT = 3
 MAX_SESSION_SEARCH_LIMIT = 10
 SESSION_SEARCH_SCAN_LIMIT = 50
@@ -2509,16 +2538,439 @@ def _byterover_query_payload(
     return base
 
 
+def _normalize_cortexiq_namespace(item: Any) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return {"slug": str(item)}
+    out = {
+        "id": item.get("id"),
+        "slug": item.get("slug") or item.get("name") or "",
+        "name": item.get("name") or "",
+        "description": item.get("description") or "",
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+    return {key: _json_safe(value) for key, value in out.items()}
+
+
+def _check_cortexiq_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _normalize_cortexiq_result(item: Any, index: int) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return {
+            "id": index + 1,
+            "content": str(item),
+            "score": None,
+            "similarity": None,
+            "match": "",
+            "type": "",
+            "created_at": None,
+        }
+    content = str(item.get("content") or "").strip()
+    score = item.get("score")
+    similarity = item.get("similarity")
+    return {
+        "id": item.get("fact_id") or item.get("id") or index + 1,
+        "content": content,
+        "score": score if isinstance(score, (int, float)) else None,
+        "similarity": similarity if isinstance(similarity, (int, float)) else None,
+        "match": str(item.get("match") or ""),
+        "type": str(item.get("type") or ""),
+        "confidence": item.get("confidence") if isinstance(item.get("confidence"), (int, float)) else None,
+        "importance": item.get("importance") if isinstance(item.get("importance"), (int, float)) else None,
+        "namespace_id": item.get("namespace_id"),
+        "created_at": item.get("created_at"),
+    }
+
+
+def _normalize_cortexiq_fact(item: Any, index: int) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return {
+            "id": index + 1,
+            "content": str(item),
+            "entity": "",
+            "property": "",
+            "value": "",
+            "confidence": None,
+            "created_at": None,
+            "updated_at": None,
+        }
+    confidence = item.get("confidence")
+    return {
+        "id": item.get("id") or index + 1,
+        "content": str(item.get("content") or ""),
+        "entity": str(item.get("entity") or ""),
+        "property": str(item.get("property") or ""),
+        "value": str(item.get("value") or ""),
+        "confidence": confidence if isinstance(confidence, (int, float)) else None,
+        "namespace_id": item.get("namespace_id"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "valid_from": item.get("valid_from"),
+        "valid_until": item.get("valid_until"),
+    }
+
+
+def _load_cortexiq_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Load non-secret CortexIQ provider settings following the provider contract.
+
+    Mirrors the bundled ``cortexiq_hermes`` provider: ``$HERMES_HOME/cortexiq.json``
+    (or ``cortexiq/config.json``) wins over profile-scoped environment values,
+    which win over defaults. The API token is never returned, only detected as a
+    boolean ``token_present`` flag.
+    """
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    home = _hermes_home()
+    candidates = [home / "cortexiq.json", home / "cortexiq" / "config.json"]
+    config_path = candidates[0]
+    file_cfg: Dict[str, Any] = {}
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        config_path = candidate
+        file_cfg = _read_json(candidate)
+        break
+
+    profile = home.name if home.parent.name == "profiles" and home.name else "default"
+
+    def setting(key: str, default: str = "") -> str:
+        value = file_cfg.get(key)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        env_name = CORTEXIQ_ENV_KEYS.get(key)
+        if env_name:
+            return _env_value(env_name, default)
+        return default
+
+    api_url = (setting("api_url", CORTEXIQ_DEFAULT_API_URL) or CORTEXIQ_DEFAULT_API_URL).rstrip("/")
+    base_namespace = (setting("base_namespace", "/hermes") or "/hermes").strip()
+    if not base_namespace.startswith("/"):
+        base_namespace = "/" + base_namespace
+
+    single_namespace = setting("namespace", "").strip()
+    explicit_namespaces_raw = file_cfg.get("namespaces")
+    explicit_namespaces = (
+        [str(entry) for entry in explicit_namespaces_raw]
+        if isinstance(explicit_namespaces_raw, list) and explicit_namespaces_raw
+        else []
+    )
+    recall_scope = (setting("recall_scope", "global") or "global").strip().lower()
+
+    # Mirror the provider's recall scope resolution: explicit namespaces list >
+    # explicit single namespace > scope; "global" (default) means no filter.
+    if explicit_namespaces:
+        recall_namespaces: Optional[List[str]] = explicit_namespaces
+    elif single_namespace and single_namespace != "/":
+        recall_namespaces = [single_namespace]
+    elif recall_scope == "profile":
+        recall_namespaces = [f"{base_namespace}/{profile}"]
+    elif recall_scope == "base":
+        recall_namespaces = [base_namespace]
+    else:
+        recall_namespaces = None
+
+    ingest_namespace = setting("ingest_namespace", "").strip() or f"{base_namespace}/{profile}"
+    if not ingest_namespace.startswith("/"):
+        ingest_namespace = "/" + ingest_namespace
+    ingest_path = setting("ingest_path", CORTEXIQ_INGEST_PATH) or CORTEXIQ_INGEST_PATH
+    if not ingest_path.startswith("/"):
+        ingest_path = "/" + ingest_path
+
+    return {
+        "config_path": str(config_path),
+        "config_exists": any(candidate.exists() for candidate in candidates),
+        "profile": profile,
+        "api_url": api_url,
+        "token_present": bool(_env_value("CORTEXIQ_API_TOKEN")),
+        "recall_scope": recall_scope,
+        "recall_namespaces": recall_namespaces,
+        "base_namespace": base_namespace,
+        "namespace": single_namespace,
+        "namespaces_configured": explicit_namespaces,
+        "ingest_namespace": ingest_namespace,
+        "ingest_path": ingest_path,
+        "recall_limit": max(1, min(_check_cortexiq_int(setting("recall_limit", "5"), 5), 100)),
+        "min_score": min(1.0, max(0.0, _check_cortexiq_float(setting("min_score", "0.6"), 0.6))),
+        "max_chars": max(0, _check_cortexiq_int(setting("max_chars", "1400"), 1400)),
+        "capture_assistant": _truthy(setting("capture_assistant", "false")),
+        "assistant_max_chars": max(0, _check_cortexiq_int(setting("assistant_max_chars", "0"), 0)),
+        "capture_max_chars": max(0, _check_cortexiq_int(setting("capture_max_chars", "4000"), 4000)),
+        "turn_importance": min(1.0, max(0.0, _check_cortexiq_float(setting("turn_importance", "0.5"), 0.5))),
+    }
+
+
+def _check_cortexiq_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _cortexiq_token() -> str:
+    """Read the API token at request time; never store or return its value."""
+    return _env_value("CORTEXIQ_API_TOKEN")
+
+
+def _cortexiq_request(
+    method: str,
+    path: str,
+    cfg: Dict[str, Any],
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = CORTEXIQ_FETCH_TIMEOUT,
+) -> Dict[str, Any]:
+    """One read-only CortexIQ HTTP call. Returns {ok, error, data}."""
+    token = _cortexiq_token()
+    if not token:
+        return {
+            "ok": False,
+            "error": "CORTEXIQ_API_TOKEN is not set for the active profile.",
+            "data": None,
+        }
+    base = str(cfg.get("api_url") or CORTEXIQ_DEFAULT_API_URL).rstrip("/")
+    url = f"{base}{path}"
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    body = None
+    headers: Dict[str, str] = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    try:
+        request_ = urllib.request.Request(url, data=body, method=method, headers=headers)
+        with urllib.request.urlopen(request_, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read()[:300].decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        message = f"CortexIQ API returned HTTP {exc.code} for {path}"
+        if detail:
+            message += f": {detail}"
+        return {"ok": False, "error": _safe_error(message), "data": None}
+    except Exception as exc:
+        return {"ok": False, "error": _safe_error(exc), "data": None}
+    try:
+        parsed = json.loads(raw or b"{}")
+    except Exception:
+        parsed = {"raw": (raw or b"").decode("utf-8", errors="replace")}
+    return {"ok": True, "error": None, "data": parsed}
+
+
+def _cortexiq_config_summary(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """The status-shaped CortexIQ config block, shared by /status and payloads."""
+    return {
+        "config_path": cfg["config_path"],
+        "config_exists": cfg["config_exists"],
+        "api_url": cfg["api_url"],
+        "token_present": cfg["token_present"],
+        "recall_scope": cfg["recall_scope"],
+        "recall_namespaces": cfg["recall_namespaces"],
+        "base_namespace": cfg["base_namespace"],
+        "ingest_namespace": cfg["ingest_namespace"],
+        "ingest_path": cfg["ingest_path"],
+        "recall_limit": cfg["recall_limit"],
+        "min_score": cfg["min_score"],
+        "max_chars": cfg["max_chars"],
+        "capture_assistant": cfg["capture_assistant"],
+    }
+
+
+def _cortexiq_payload(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = DEFAULT_CORTEXIQ_LIMIT,
+) -> Dict[str, Any]:
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    provider = _dig(config, "memory", "provider", default=None)
+    cfg = _load_cortexiq_config(config)
+    limit = max(1, min(_check_cortexiq_int(limit, DEFAULT_CORTEXIQ_LIMIT), MAX_CORTEXIQ_LIMIT))
+
+    base: Dict[str, Any] = {
+        "id": "cortexiq",
+        "label": "CortexIQ memory",
+        "provider_configured": provider == "cortexiq",
+        "mode": "read-only",
+        **_cortexiq_config_summary(cfg),
+        "namespaces": [],
+        "namespace_count": 0,
+        "stats": {},
+        "entry_count": 0,
+        "database_bytes": 0,
+        "oldest": None,
+        "newest": None,
+        "tables": [],
+        "limit": limit,
+        "error": None,
+        "generated_at": time.time(),
+    }
+
+    if not cfg["token_present"]:
+        base["error"] = (
+            "CORTEXIQ_API_TOKEN is not set for the active profile. Add it to "
+            "$HERMES_HOME/.env to inspect CortexIQ memory."
+        )
+        return base
+    if not base["provider_configured"]:
+        # Remote reads stay reserved for the active provider; the explicit
+        # /cortexiq* endpoints still work for configured-but-installed setups.
+        return base
+
+    stats = _cortexiq_request("GET", CORTEXIQ_STATS_PATH, cfg, timeout=CORTEXIQ_FETCH_TIMEOUT)
+    if stats["ok"]:
+        data = stats["data"] if isinstance(stats["data"], dict) else {}
+        base["stats"] = _json_safe(data)
+        base["entry_count"] = _check_cortexiq_int(data.get("entry_count"), 0)
+        base["database_bytes"] = _check_cortexiq_int(data.get("database_bytes"), 0)
+        oldest = data.get("oldest")
+        newest = data.get("newest")
+        if oldest is not None:
+            base["oldest"] = _json_safe(oldest)
+        if newest is not None:
+            base["newest"] = _json_safe(newest)
+        tables = data.get("tables")
+        if isinstance(tables, list):
+            base["tables"] = [_json_safe(table) for table in tables]
+    elif stats["error"]:
+        base["error"] = stats["error"]
+
+    namespaces = _cortexiq_request("GET", CORTEXIQ_NAMESPACES_PATH, cfg, timeout=CORTEXIQ_FETCH_TIMEOUT)
+    if namespaces["ok"]:
+        rows = namespaces["data"] if isinstance(namespaces["data"], list) else []
+        base["namespaces"] = [_normalize_cortexiq_namespace(item) for item in rows]
+        base["namespace_count"] = len(base["namespaces"])
+    elif namespaces["error"] and not base["error"]:
+        base["error"] = namespaces["error"]
+
+    return base
+
+
+def _cortexiq_facts_payload(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = DEFAULT_CORTEXIQ_LIMIT,
+) -> Dict[str, Any]:
+    """Read-only page of consolidated facts from GET /api/v1/facts."""
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    provider = _dig(config, "memory", "provider", default=None)
+    cfg = _load_cortexiq_config(config)
+    limit = max(1, min(_check_cortexiq_int(limit, DEFAULT_CORTEXIQ_LIMIT), MAX_CORTEXIQ_LIMIT))
+
+    base: Dict[str, Any] = {
+        "id": "cortexiq",
+        "label": "CortexIQ contents",
+        "provider_configured": provider == "cortexiq",
+        "operation": "contents",
+        "facts": [],
+        "fact_count": 0,
+        "total_facts": 0,
+        "limit": limit,
+        "error": None,
+        "generated_at": time.time(),
+    }
+    if not cfg["token_present"]:
+        base["error"] = "CORTEXIQ_API_TOKEN is not set for the active profile."
+        return base
+
+    result = _cortexiq_request(
+        "GET",
+        CORTEXIQ_FACTS_PATH,
+        cfg,
+        params={"limit": limit},
+        timeout=CORTEXIQ_FETCH_TIMEOUT,
+    )
+    if not result["ok"]:
+        base["error"] = result["error"]
+        return base
+    data = result["data"] if isinstance(result["data"], dict) else {}
+    rows = data.get("items")
+    if not isinstance(rows, list):
+        rows = []
+    base["facts"] = [_normalize_cortexiq_fact(item, index) for index, item in enumerate(rows)]
+    base["fact_count"] = len(base["facts"])
+    base["total_facts"] = _check_cortexiq_int(data.get("total"), base["fact_count"])
+    return base
+
+
+def _cortexiq_recall_payload(
+    query: str,
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = DEFAULT_CORTEXIQ_LIMIT,
+) -> Dict[str, Any]:
+    """Explicit hybrid recall through POST /api/v1/recall, mirroring the provider."""
+    cfg = _load_cortexiq_config(config)
+    limit = max(1, min(_check_cortexiq_int(limit, DEFAULT_CORTEXIQ_LIMIT), MAX_CORTEXIQ_LIMIT))
+
+    base: Dict[str, Any] = {
+        "id": "cortexiq",
+        "label": "CortexIQ memory",
+        "provider_configured": _dig(config or {}, "memory", "provider", default=None) == "cortexiq",
+        "operation": "recall",
+        "query": query,
+        "result_source": CORTEXIQ_RECALL_PATH,
+        "namespaces_used": cfg["recall_namespaces"],
+        "results": [],
+        "result_count": 0,
+        "limit": limit,
+        "error": None,
+        "generated_at": time.time(),
+    }
+    if not str(query or "").strip():
+        base["error"] = "Recall query is required."
+        return base
+    if not cfg["token_present"]:
+        base["error"] = "CORTEXIQ_API_TOKEN is not set for the active profile."
+        return base
+
+    payload: Dict[str, Any] = {"query": str(query).strip(), "limit": limit}
+    namespaces = cfg["recall_namespaces"]
+    if namespaces:
+        payload["namespaces"] = namespaces
+    result = _cortexiq_request(
+        "POST",
+        CORTEXIQ_RECALL_PATH,
+        cfg,
+        payload=payload,
+        timeout=CORTEXIQ_RECALL_TIMEOUT,
+    )
+    if not result["ok"]:
+        base["error"] = result["error"]
+        return base
+    data = result["data"] if isinstance(result["data"], dict) else {}
+    rows = data.get("results")
+    if not isinstance(rows, list):
+        rows = []
+    base["results"] = [_normalize_cortexiq_result(item, index) for index, item in enumerate(rows)]
+    base["result_count"] = len(base["results"])
+    return base
+
+
 @router.get("/status")
 async def status() -> Dict[str, Any]:
     home = _hermes_home()
-    config = _read_yaml(home / "config.yaml")
+    config = _read_yaml(_hermes_home() / "config.yaml")
     db_path = _resolve_holographic_db(config)
     mem0_cfg = _load_mem0_config(config)
     honcho_cfg = _honcho_config_payload(config)
     mnemosyne_cfg = _load_mnemosyne_config(config)
     hindsight_cfg = _load_hindsight_config(config)
     byterover_cfg = _load_byterover_config(config)
+    cortexiq_cfg = _cortexiq_config_summary(_load_cortexiq_config(config))
     return {
         "plugin": "hermes-memory-ui",
         "version": PLUGIN_VERSION,
@@ -2594,6 +3046,10 @@ async def status() -> Dict[str, Any]:
             "auto_retain": hindsight_cfg["auto_retain"],
             "auto_recall": hindsight_cfg["auto_recall"],
             "provider_configured": hindsight_cfg["provider_configured"],
+        },
+        "cortexiq": {
+            **cortexiq_cfg,
+            "provider_configured": _dig(config, "memory", "provider", default=None) == "cortexiq",
         },
         "generated_at": time.time(),
     }
@@ -2684,6 +3140,28 @@ async def hindsight_reflect(
     return _hindsight_payload(query=query, limit=1, mode="reflect")
 
 
+@router.get("/cortexiq")
+async def cortexiq(
+    limit: int = Query(DEFAULT_CORTEXIQ_LIMIT, ge=1, le=MAX_CORTEXIQ_LIMIT),
+) -> Dict[str, Any]:
+    return _cortexiq_payload(limit=limit)
+
+
+@router.get("/cortexiq/contents")
+async def cortexiq_contents(
+    limit: int = Query(DEFAULT_CORTEXIQ_LIMIT, ge=1, le=MAX_CORTEXIQ_LIMIT),
+) -> Dict[str, Any]:
+    return _cortexiq_facts_payload(limit=limit)
+
+
+@router.get("/cortexiq/recall")
+async def cortexiq_recall(
+    query: str = Query(...),
+    limit: int = Query(DEFAULT_CORTEXIQ_LIMIT, ge=1, le=MAX_CORTEXIQ_LIMIT),
+) -> Dict[str, Any]:
+    return _cortexiq_recall_payload(query=query, limit=limit)
+
+
 @router.get("/mnemosyne")
 async def mnemosyne() -> Dict[str, Any]:
     return _mnemosyne_contents_payload()
@@ -2738,5 +3216,6 @@ async def snapshot(
         "mnemosyne": _mnemosyne_contents_payload(config, limit=limit, search=search or None),
         "byterover": _byterover_payload(config, limit=limit, search=search or None),
         "hindsight": _hindsight_payload(config, mode="status"),
+        "cortexiq": _cortexiq_payload(config, limit=limit),
         "generated_at": time.time(),
     }

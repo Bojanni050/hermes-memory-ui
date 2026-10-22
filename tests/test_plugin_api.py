@@ -1796,3 +1796,168 @@ def test_byterover_search_requires_project_root_to_avoid_creating_context(monkey
     calls = [json.loads(line)["argv"] for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert ["locations", "--format", "json"] in calls
     assert not any(call and call[0] in {"search", "query", "status"} for call in calls)
+
+
+def test_cortexiq_config_loads_json_over_env_and_hides_token(monkeypatch, tmp_path):
+    (tmp_path / "cortexiq.json").write_text(
+        json.dumps({"recall_scope": "profile", "min_score": 0.7}),
+        encoding="utf-8",
+    )
+    # The provider resolves JSON first; env values must not win underneath it.
+    for key in ("CORTEXIQ_RECALL_SCOPE", "CORTEXIQ_API_TOKEN", "CORTEXIQ_API_URL",
+                "CORTEXIQ_MIN_SCORE", "CORTEXIQ_NAMESPACE", "CORTEXIQ_INGEST_NAMESPACE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CORTEXIQ_RECALL_SCOPE", "global")
+    monkeypatch.setenv("CORTEXIQ_API_TOKEN", "secret-token")
+    monkeypatch.setenv("CORTEXIQ_API_URL", "http://127.0.0.1:18101/")
+
+    module = load_plugin_api(monkeypatch, tmp_path)
+    cfg = module._load_cortexiq_config()
+
+    assert cfg["config_exists"] is True
+    assert cfg["recall_scope"] == "profile"
+    # home is tmp_path here, so the profile segment resolves to "default"
+    assert cfg["recall_namespaces"] == ["/hermes/default"]
+    assert cfg["ingest_namespace"] == "/hermes/default"
+    assert cfg["min_score"] == 0.7  # python value from JSON, not the env string
+    assert cfg["token_present"] is True
+    dumped = json.dumps(cfg)
+    assert "secret-token" not in dumped
+
+
+def test_cortexiq_payload_requires_token_without_any_network(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: cortexiq\n", encoding="utf-8")
+    monkeypatch.delenv("CORTEXIQ_API_TOKEN", raising=False)
+    module = load_plugin_api(monkeypatch, tmp_path)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("no remote call may happen without a token")
+
+    monkeypatch.setattr(module, "_cortexiq_request", explode)
+    payload = module._cortexiq_payload()
+
+    assert payload["provider_configured"] is True
+    assert payload["token_present"] is False
+    assert "CORTEXIQ_API_TOKEN" in (payload["error"] or "")
+    assert payload["stats"] == {}
+
+
+def test_cortexiq_payload_skips_remote_calls_when_provider_not_active(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: holographic\n", encoding="utf-8")
+    monkeypatch.setenv("CORTEXIQ_API_TOKEN", "secret-token")
+    module = load_plugin_api(monkeypatch, tmp_path)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("inactive provider must not trigger remote reads")
+
+    monkeypatch.setattr(module, "_cortexiq_request", explode)
+    payload = module._cortexiq_payload()
+
+    assert payload["provider_configured"] is False
+    assert payload["entry_count"] == 0
+
+
+def test_cortexiq_payload_fetches_stats_and_namespaces_when_active(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: cortexiq\n", encoding="utf-8")
+    monkeypatch.setenv("CORTEXIQ_API_TOKEN", "secret-token")
+    module = load_plugin_api(monkeypatch, tmp_path)
+    calls = []
+
+    def fake_request(method, path, cfg, *, payload=None, params=None, timeout=10.0):
+        calls.append((method, path, params, payload))
+        if path == module.CORTEXIQ_STATS_PATH:
+            return {"ok": True, "error": None, "data": {
+                "entry_count": 9040,
+                "database_bytes": 56228887,
+                "tables": [{"name": "facts", "rows": 766, "size_bytes": 1024}],
+            }}
+        if path == module.CORTEXIQ_NAMESPACES_PATH:
+            return {"ok": True, "error": None, "data": [
+                {"id": 93, "slug": "/hermes/default", "name": "Hermes agent"},
+            ]}
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(module, "_cortexiq_request", fake_request)
+    snapshot = module._cortexiq_payload()
+
+    assert snapshot["entry_count"] == 9040
+    assert snapshot["database_bytes"] == 56228887
+    assert snapshot["namespace_count"] == 1
+    assert snapshot["namespaces"][0]["slug"] == "/hermes/default"
+    # every recorded call is a body-less read: no mutation endpoint was touched
+    assert all(call[0] == "GET" and call[3] is None for call in calls)
+
+
+def test_cortexiq_recall_posts_scope_namespaces_and_never_leaks_token(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: cortexiq\n", encoding="utf-8")
+    (tmp_path / "cortexiq.json").write_text(
+        json.dumps({"recall_scope": "base", "base_namespace": "/hermes"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CORTEXIQ_API_TOKEN", "secret-token")
+    module = load_plugin_api(monkeypatch, tmp_path)
+    captured = {}
+
+    def fake_request(method, path, cfg, *, payload=None, params=None, timeout=10.0):
+        captured["method"] = method
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"ok": True, "error": None, "data": {"results": [
+            {"fact_id": 12, "content": "decided on timedelta", "score": 0.71,
+             "similarity": 0.5, "match": "hybrid", "type": "fact",
+             "created_at": "2026-10-22T08:00:00Z"},
+            "plain string row",
+        ]}}
+
+    monkeypatch.setattr(module, "_cortexiq_request", fake_request)
+    payload = module._cortexiq_recall_payload(query="codename", limit=5)
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == module.CORTEXIQ_RECALL_PATH
+    assert captured["payload"] == {
+        "query": "codename",
+        "limit": 5,
+        "namespaces": ["/hermes"],
+    }
+    assert payload["results"][0]["id"] == 12
+    assert payload["results"][0]["score"] == 0.71
+    assert payload["results"][0]["match"] == "hybrid"
+    assert payload["results"][1]["content"] == "plain string row"
+    assert payload["result_count"] == 2
+    assert payload["namespaces_used"] == ["/hermes"]
+    assert "secret-token" not in json.dumps(payload)
+
+
+def test_cortexiq_recall_requires_query(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: cortexiq\n", encoding="utf-8")
+    monkeypatch.setenv("CORTEXIQ_API_TOKEN", "secret-token")
+    module = load_plugin_api(monkeypatch, tmp_path)
+    payload = module._cortexiq_recall_payload(query="   ")
+    assert payload["error"] == "Recall query is required."
+    assert payload["result_count"] == 0
+
+
+def test_cortexiq_facts_normalize_and_count(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: cortexiq\n", encoding="utf-8")
+    monkeypatch.setenv("CORTEXIQ_API_TOKEN", "secret-token")
+    module = load_plugin_api(monkeypatch, tmp_path)
+
+    def fake_request(method, path, cfg, *, payload=None, params=None, timeout=10.0):
+        assert method == "GET" and path == module.CORTEXIQ_FACTS_PATH
+        assert params == {"limit": 25}
+        return {"ok": True, "error": None, "data": {"items": [
+            {"id": 5, "content": "fact text", "entity": "provider", "property": "transport",
+             "value": "http", "confidence": 0.6, "created_at": "2026-10-22T08:00:00Z",
+             "updated_at": "2026-10-22T09:00:00Z", "valid_from": None, "valid_until": None},
+        ], "total": 766}}
+
+    monkeypatch.setattr(module, "_cortexiq_request", fake_request)
+    contents = module._cortexiq_facts_payload()
+
+    assert contents["fact_count"] == 1
+    assert contents["total_facts"] == 766
+    fact = contents["facts"][0]
+    assert fact["content"] == "fact text"
+    assert fact["entity"] == "provider"
+    assert fact["property"] == "transport" and fact["value"] == "http"
+    assert "secret-token" not in json.dumps(contents)

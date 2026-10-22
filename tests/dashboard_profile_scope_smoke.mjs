@@ -173,7 +173,8 @@ const snapshot = {
   },
   mnemosyne: { provider_configured: true, memories: [], facts: [], db_exists: false },
   hindsight: { provider_configured: true, memories: [], documents: [] },
-  byterover: { provider_configured: true, locations: [], results: [], project_exists: true }
+  byterover: { provider_configured: true, locations: [], results: [], project_exists: true },
+  cortexiq: { provider_configured: true, namespaces: [], entry_count: 0, database_bytes: 0, recall_namespaces: null, stats: null }
 }
 const everyPath = makeHarness('?profile=alpha', {
   defaultText: 'probe',
@@ -222,6 +223,8 @@ assert.deepEqual(
   [...exercisedPaths].sort(),
   [
     '/api/plugins/hermes-memory-ui/byterover/query',
+    '/api/plugins/hermes-memory-ui/cortexiq/contents',
+    '/api/plugins/hermes-memory-ui/cortexiq/recall',
     '/api/plugins/hermes-memory-ui/hindsight/contents',
     '/api/plugins/hermes-memory-ui/hindsight/recall',
     '/api/plugins/hermes-memory-ui/hindsight/reflect',

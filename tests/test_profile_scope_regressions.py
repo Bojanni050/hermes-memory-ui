@@ -260,6 +260,8 @@ def test_dashboard_forwards_profile_and_suppresses_stale_responses():
     assert payload == {
         "exercisedRequestPaths": [
             "/api/plugins/hermes-memory-ui/byterover/query",
+            "/api/plugins/hermes-memory-ui/cortexiq/contents",
+            "/api/plugins/hermes-memory-ui/cortexiq/recall",
             "/api/plugins/hermes-memory-ui/hindsight/contents",
             "/api/plugins/hermes-memory-ui/hindsight/recall",
             "/api/plugins/hermes-memory-ui/hindsight/reflect",

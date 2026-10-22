@@ -83,6 +83,10 @@ def test_desktop_plugin_registers_native_surfaces_and_scoped_api_calls():
             "temporalWeightOptions": [0, 0.2, 0.5, 0.8, 1],
         },
         "byterover": {"queryTimeout": 60},
+        "cortexiq": {
+            "defaultLimit": 25,
+            "limitOptions": [5, 10, 25, 50, 100],
+        },
         "session": {
             "defaultLimit": 3,
             "defaultSort": "newest",
@@ -100,11 +104,18 @@ def test_desktop_plugin_registers_native_surfaces_and_scoped_api_calls():
             "temporalWeight": 0.8,
         },
         "mnemosynePrefetch": {"query": "release plan"},
+        "cortexiqContents": {"limit": 100},
+        "cortexiqRecall": {"limit": 100, "query": "release plan"},
     }
-    assert result["visibleProviders"] == ["holographic", "honcho", "hindsight"]
+    assert result["visibleProviders"] == [
+        "holographic",
+        "honcho",
+        "hindsight",
+        "cortexiq",
+    ]
 
     paths = result["restPaths"]
-    assert len(paths) == 10
+    assert len(paths) == 12
     assert all(path.startswith("/") for path in paths)
     assert all(not path.startswith("/api/") for path in paths)
     assert [path.split("?", 1)[0] for path in paths] == [
@@ -118,6 +129,8 @@ def test_desktop_plugin_registers_native_surfaces_and_scoped_api_calls():
         "/mnemosyne/contents",
         "/mnemosyne/recall",
         "/mnemosyne/prefetch",
+        "/cortexiq/contents",
+        "/cortexiq/recall",
     ]
     queries = [parse_qs(urlsplit(path).query) for path in paths]
     assert queries[0] == {
@@ -147,6 +160,8 @@ def test_desktop_plugin_registers_native_surfaces_and_scoped_api_calls():
         "temporal_weight": ["0.8"],
     }
     assert queries[9] == {"query": ["inject dashboard"]}
+    assert queries[10] == {"limit": ["50"]}
+    assert queries[11] == {"limit": ["50"], "query": ["remember dashboard"]}
     assert result["restTimeouts"] == [
         120_000,
         120_000,
@@ -155,6 +170,8 @@ def test_desktop_plugin_registers_native_surfaces_and_scoped_api_calls():
         120_000,
         120_000,
         180_000,
+        120_000,
+        120_000,
         120_000,
         120_000,
         120_000,
@@ -168,10 +185,10 @@ def test_desktop_release_version_and_documentation_are_consistent():
     plugin_api = (ROOT / "dashboard" / "plugin_api.py").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert re.search(r"^version:\s*0\.6\.4\s*$", plugin_yaml, re.MULTILINE)
-    assert manifest["version"] == "0.6.4"
-    assert 'PLUGIN_VERSION = "0.6.4"' in plugin_api
-    assert "const VERSION = '0.6.4'" in source
+    assert re.search(r"^version:\s*0\.6\.5\s*$", plugin_yaml, re.MULTILINE)
+    assert manifest["version"] == "0.6.5"
+    assert 'PLUGIN_VERSION = "0.6.5"' in plugin_api
+    assert "const VERSION = '0.6.5'" in source
     assert "Hermes Desktop" in readme
     assert "$HERMES_HOME/desktop-plugins/hermes-memory-ui/plugin.js" in readme
     assert "Settings" in readme and "Plugins" in readme

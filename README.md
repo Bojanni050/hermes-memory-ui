@@ -32,6 +32,10 @@ Current scope:
   * ByteRover memory:
     + read-only ByteRover CLI (`brv`) project status and registered locations
     + explicit BM25 search and optional query/synthesis action; no curate/write flow
+  * CortexIQ memory:
+    + read-only config, store statistics, and namespace list through the CortexIQ HTTP API
+    + explicit hybrid (RRF) recall mirroring the bundled cortexiq_hermes provider
+    + page of consolidated facts; no remember/ingest or namespace-write flow
 
 This plugin is intentionally read-only. It does not add, edit, replace, or remove memories. That is deliberate: writes should go through Hermes' `memory` and `fact_store` tools or provider classes so validation, locking, mirroring, FTS, HRR vectors, and memory-bank maintenance are preserved.
 
@@ -181,7 +185,7 @@ uv run --with pytest==9.1.1 --with pyyaml==6.0.3 python -m pytest -q
 Both interfaces expose the same configured providers, snapshot filters, visible data, and explicit provider operations, although each uses controls native to its host:
 
 - Snapshot `search` and `limit` apply across providers; `category` and `min_trust` apply only to Holographic facts.
-- Hindsight exposes contents, recall, and reflect. Mnemosyne exposes contents, recall with temporal weight, and prefetch preview. ByteRover exposes snapshot search and explicit query/synthesis.
+- Hindsight exposes contents, recall, and reflect. Mnemosyne exposes contents, recall with temporal weight, and prefetch preview. ByteRover exposes snapshot search and explicit query/synthesis. CortexIQ exposes config/stats/namespaces, a facts page, and explicit hybrid recall.
 - Session search is always user-triggered and supports a source filter. Desktop also exposes newest/oldest sorting; Dashboard currently submits newest-first.
 - Dashboard and Desktop both call the same query-only endpoints. Neither interface exposes provider retain, remember, curate, update, or delete operations.
 
@@ -196,6 +200,7 @@ Top summary:
 - Mnemosyne episode count only when `memory.provider` is currently `mnemosyne`
 - Hindsight bank/status only when `memory.provider` is currently `hindsight`
 - ByteRover registered location count only when `memory.provider` is currently `byterover`
+- CortexIQ store entry count only when `memory.provider` is currently `cortexiq`
 
 Built-in memory section:
 
@@ -269,6 +274,18 @@ ByteRover memory section, displayed when `memory.provider` is currently `byterov
 - explicit BM25 `Search / refresh` action through `brv search --format json`
 - explicit `Run query` action through `brv query --format json`
 - no `curate`, `review approve`, version-control, sync, or write endpoints
+
+## CortexIQ memory section
+
+CortexIQ section, displayed while `memory.provider` is currently `cortexiq`:
+
+- whether CortexIQ is the active provider and whether `CORTEXIQ_API_TOKEN` is present
+- resolved API URL, recall scope, searched namespaces, base/ingest namespaces, recall limit, minimum RRF score, max chars, and capture-assistant flag
+- store statistics from `GET /api/v1/stats`: entry count, database size, oldest/newest rows, and table counts
+- stored namespace list
+- a read-only page of consolidated facts from `GET /api/v1/facts` with a manual `Refresh contents` action
+- explicit `Recall` query button for hybrid (RRF) recall through `POST /api/v1/recall`, mirroring the provider's namespace scope and score threshold
+- no `remember`/ingest, namespace creation, forget, or MCP write-tool access
 
 ## Holographic DB path resolution
 
@@ -403,6 +420,30 @@ Recall and reflect resolve Hermes' installed Hindsight provider through the host
 Recall and reflect show only native Hindsight results. Retained source documents are displayed separately in the contents view; they are not used as a fallback for recall or reflect.
 
 It does not expose `hindsight_retain` or any write UI.
+
+## CortexIQ configuration
+
+CortexIQ support follows Hermes' bundled `cortexiq_hermes` memory provider convention. The plugin resolves settings with the same precedence as the provider:
+
+1. `$HERMES_HOME/cortexiq.json` (or `$HERMES_HOME/cortexiq/config.json`)
+2. environment variables scoped to the profile, such as `CORTEXIQ_API_URL`, `CORTEXIQ_RECALL_SCOPE`, `CORTEXIQ_NAMESPACE_BASE`, `CORTEXIQ_NAMESPACE`, and `CORTEXIQ_INGEST_NAMESPACE`
+3. defaults (`http://127.0.0.1:18101`, scope `global`, base namespace `/hermes`, recall limit 5, min score 0.6)
+
+The API token comes from `CORTEXIQ_API_TOKEN` in the profile's secret scope or `$HERMES_HOME/.env`. It is only detected as a boolean `token_present` flag and never returned in plugin responses.
+
+Example `$HERMES_HOME/cortexiq.json`:
+
+```json
+{"recall_scope": "profile", "base_namespace": "/hermes", "recall_limit": 8, "min_score": 0.65, "capture_assistant": true}
+```
+
+The plugin performs read-only calls to the CortexIQ server API:
+
+- `GET /api/v1/stats` and `GET /api/v1/namespaces`
+- `GET /api/v1/facts?limit=N` for the contents view
+- `POST /api/v1/recall` only after the user clicks `Recall`
+
+It never calls `/api/v1/remember`, `POST /api/v1/namespaces`, or the CortexIQ MCP write tools (goals, hypotheses, causal links, ...). Capturing conversations stays the provider's own background loop inside Hermes turns.
 
 ## ByteRover configuration
 
